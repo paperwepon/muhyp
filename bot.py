@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import sqlite3
 import traceback
@@ -6,24 +7,30 @@ import traceback
 import discord
 from discord import app_commands
 from discord.ext import commands
+from dotenv import load_dotenv
 
 
 # =========================================================
-# 설정
+# 환경변수
 # =========================================================
+
+# 디스호스트의 .env를 우선적으로 확인하고,
+# 현재 작업 폴더의 .env도 함께 확인합니다.
+load_dotenv("/home/container/.env")
+load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
     raise RuntimeError(
-        "DISCORD_TOKEN 환경변수가 설정되지 않았습니다."
+        "DISCORD_TOKEN 환경변수가 설정되지 않았습니다.\n"
+        "디스호스트의 환경변수 설정에서 DISCORD_TOKEN을 확인하세요."
     )
 
 
 # =========================================================
 # 기본 설정
 # =========================================================
-
 STATS = [
     "기혈",
     "내공",
