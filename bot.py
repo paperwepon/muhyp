@@ -1517,7 +1517,7 @@ async def stats_save(
         content="✅ 스탯을 저장했습니다.", embed=character_embed(data), ephemeral=True)
 
 
-@bot.tree.command(name="스탯수��", description="내 캐릭터의 최종 스탯 한 항목을 수정합니다.")
+@bot.tree.command(name="스탯수정", description="내 캐릭터의 최종 스탯 한 항목을 수정합니다.")
 @app_commands.choices(능력치=[app_commands.Choice(name=stat, value=stat) for stat in STATS])
 @app_commands.describe(값="변경 후 최종값을 입력하세요. (1 이상)")
 async def stats_edit(
