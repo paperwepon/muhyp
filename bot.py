@@ -402,11 +402,9 @@ def character_embed(data):
 
     embed.add_field(
         name="📊 최종 능력치",
-        value=final_stats_text(
-            data["final_stats"],
-            data["bonus_stat"],
-            data["bonus_amount"]
-        ),
+        value=("\n".join(f"**{stat}**　{data['final_stats'][stat]}" for stat in STATS)
+               if data.get("manual_stats") else final_stats_text(
+                   data["final_stats"], data["bonus_stat"], data["bonus_amount"])),
         inline=False
     )
 
@@ -492,6 +490,11 @@ class PresetButton(
             interaction.user.id
         )
 
+        if data["final_stats"] is not None:
+            await interaction.response.send_message(
+                "❌ 최종 스탯이 이미 저장되었습니다. `/스탯수정`을 사용하세요.", ephemeral=True)
+            return
+
         if len(data["presets"]) < self.number:
 
             await interaction.response.send_message(
@@ -549,6 +552,11 @@ class RerollButton(
         data = get_user_data(
             interaction.user.id
         )
+
+        if data["final_stats"] is not None:
+            await interaction.response.send_message(
+                "❌ 최종 스탯이 이미 저장되었습니다. `/스탯수정`을 사용하세요.", ephemeral=True)
+            return
 
         if len(data["presets"]) >= 3:
 
@@ -684,6 +692,16 @@ class BonusSelect(
             interaction.user.id
         )
 
+        if data["final_stats"] is not None:
+            await interaction.response.send_message(
+                "❌ 최종 스탯이 이미 저장되었습니다. `/스탯수정`을 사용하세요.", ephemeral=True)
+            return
+
+        if data["base_stats"] is None:
+            await interaction.response.send_message(
+                "❌ 사용할 수 없는 이전 메뉴입니다. `/캐릭터`로 다시 확인하세요.", ephemeral=True)
+            return
+
         base_value = data["base_stats"][selected]
 
         if base_value > 90:
@@ -774,9 +792,10 @@ class CharacterView(
 
         self.user_id = user_id
 
-        self.add_item(
-            CharacterRefreshButton()
-        )
+        self.add_item(CharacterSaveButton())
+        self.add_item(CharacterEditButton())
+        self.add_item(CharacterDeleteButton())
+        self.add_item(CharacterRefreshButton())
 
     async def interaction_check(
         self,
@@ -793,6 +812,150 @@ class CharacterView(
             return False
 
         return True
+
+
+# 캐릭터 상태를 비교하여 오래된 입력창의 덮어쓰기를 방지합니다.
+def character_snapshot(data):
+    keys = ("presets", "selected_preset", "base_stats", "final_stats",
+            "bonus_stat", "bonus_amount", "manual_stats")
+    return json.dumps({key: data.get(key) for key in keys}, ensure_ascii=False, sort_keys=True)
+
+
+class OwnerView(discord.ui.View):
+    def __init__(self, user_id):
+        super().__init__(timeout=900)
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ 본인의 메뉴만 사용할 수 있습니다.", ephemeral=True)
+            return False
+        return True
+
+
+class CharacterSaveButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="💾 저장", style=discord.ButtonStyle.success)
+
+    async def callback(self, interaction):
+        data = get_user_data(interaction.user.id)
+        if data["final_stats"] is None:
+            await interaction.response.send_message("❌ 저장할 최종 스탯이 없습니다.", ephemeral=True)
+            return
+        # 화면에 남은 예전 값 대신 현재 DB의 최신 캐릭터를 저장합니다.
+        save_user_data(interaction.user.id, data)
+        await interaction.response.edit_message(
+            content="✅ 현재 스탯을 저장했습니다. 수정 시에도 자동 저장됩니다.",
+            embed=character_embed(data), view=CharacterView(interaction.user.id))
+
+
+class CharacterEditButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="✏️ 수정", style=discord.ButtonStyle.primary)
+
+    async def callback(self, interaction):
+        data = get_user_data(interaction.user.id)
+        if data["final_stats"] is None:
+            await interaction.response.send_message("❌ 수정할 최종 스탯이 없습니다.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "수정할 능력치를 선택하세요. 제출하면 자동 저장됩니다.",
+            view=StatEditView(interaction.user.id), ephemeral=True)
+
+
+class StatEditView(OwnerView):
+    def __init__(self, user_id):
+        super().__init__(user_id)
+        self.add_item(StatEditSelect())
+
+
+class StatEditSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(placeholder="수정할 능력치 선택",
+                         options=[discord.SelectOption(label=stat, value=stat) for stat in STATS])
+
+    async def callback(self, interaction):
+        data = get_user_data(interaction.user.id)
+        if data["final_stats"] is None:
+            await interaction.response.send_message("❌ 캐릭터가 삭제되었습니다.", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            StatEditModal(interaction.user.id, self.values[0], data))
+
+
+class StatEditModal(discord.ui.Modal):
+    def __init__(self, user_id, stat, data):
+        super().__init__(title=f"{stat} 수정", timeout=900)
+        self.user_id = user_id
+        self.stat = stat
+        self.snapshot = character_snapshot(data)
+        self.value_input = discord.ui.TextInput(
+            label=f"{stat}의 변경 후 최종값", default=str(data["final_stats"][stat]),
+            placeholder="1 이상의 정수", max_length=10)
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ 본인의 스탯만 수정할 수 있습니다.", ephemeral=True)
+            return
+        try:
+            value = int(str(self.value_input).strip())
+        except ValueError:
+            value = 0
+        if not 1 <= value <= 2147483647:
+            await interaction.response.send_message("❌ 1~2147483647 사이의 정수를 입력하세요. 수정 버튼으로 다시 입력할 수 있습니다.", ephemeral=True)
+            return
+        data = get_user_data(self.user_id)
+        if data["final_stats"] is None or character_snapshot(data) != self.snapshot:
+            await interaction.response.send_message(
+                "❌ 입력 중 캐릭터가 변경되었습니다. `/캐릭터`에서 다시 수정하세요.", ephemeral=True)
+            return
+        previous = data["final_stats"][self.stat]
+        data["final_stats"][self.stat] = value
+        data["manual_stats"] = True
+        save_user_data(self.user_id, data)
+        await interaction.response.edit_message(
+            content=f"✅ {self.stat}: {previous} → {value} · 저장 완료",
+            embed=character_embed(data), view=CharacterView(self.user_id))
+
+
+class CharacterDeleteButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="🗑️ 삭제", style=discord.ButtonStyle.danger)
+
+    async def callback(self, interaction):
+        data = get_user_data(interaction.user.id)
+        if data["final_stats"] is None:
+            await interaction.response.send_message("❌ 삭제할 최종 스탯이 없습니다.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "스탯과 프리셋을 삭제할까요? 특성은 유지됩니다.",
+            view=StatDeleteView(interaction.user.id, data), ephemeral=True)
+
+
+class StatDeleteView(OwnerView):
+    def __init__(self, user_id, data):
+        super().__init__(user_id)
+        self.snapshot = character_snapshot(data)
+
+    @discord.ui.button(label="삭제", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        data = get_user_data(self.user_id)
+        if data["final_stats"] is None or character_snapshot(data) != self.snapshot:
+            await interaction.response.edit_message(
+                content="❌ 캐릭터가 변경되었습니다. `/캐릭터`에서 다시 확인하세요.", embed=None, view=None)
+            self.stop()
+            return
+        clear_character_stats(data)
+        save_user_data(self.user_id, data)
+        await interaction.response.edit_message(
+            content="✅ 스탯과 프리셋을 삭제했습니다. 특성은 유지됩니다.", embed=None, view=None)
+        self.stop()
+
+    @discord.ui.button(label="취소", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(content="삭제를 취소했습니다.", embed=None, view=None)
+        self.stop()
 
 
 class CharacterRefreshButton(
@@ -914,6 +1077,13 @@ async def wuxia_generate(
     data = get_user_data(
         interaction.user.id
     )
+
+    if data["final_stats"] is not None:
+        await interaction.response.send_message(
+            "❌ 저장된 스탯이 있습니다. 다시 생성하려면 `/스탯삭제 확인: True`를 먼저 사용하세요.",
+            ephemeral=True)
+        return
+    data.pop("manual_stats", None)
 
     # 능력치 생성 관련 데이터만 초기화
     data["presets"] = [
@@ -1131,7 +1301,7 @@ async def character(
         interaction.user.id
     )
 
-    if not data["presets"]:
+    if not data["presets"] and data["final_stats"] is None:
 
         await interaction.response.send_message(
             "❌ 아직 캐릭터 능력치를 생성하지 않았습니다.\n"
@@ -1170,6 +1340,82 @@ async def character(
             interaction.user.id
         )
     )
+
+
+# =========================================================
+# 스탯 직접 저장 / 수정 / 삭제 (본인 캐릭터만 관리)
+# =========================================================
+
+def clear_character_stats(data):
+    # 특성 목록과 추첨 결과는 보존하고 생성 이력만 제거합니다.
+    data.update(presets=[], selected_preset=None, base_stats=None,
+                final_stats=None, bonus_stat=None, bonus_amount=None)
+    data.pop("manual_stats", None)
+
+
+@bot.tree.command(name="스탯저장", description="8개 최종 스탯을 직접 입력하여 저장합니다.")
+@app_commands.describe(덮어쓰기="기존 스탯을 교체하려면 True를 선택하세요.")
+async def stats_save(
+    interaction: discord.Interaction,
+    기혈: app_commands.Range[int, 1, 2147483647],
+    내공: app_commands.Range[int, 1, 2147483647],
+    이동: app_commands.Range[int, 1, 2147483647],
+    근력: app_commands.Range[int, 1, 2147483647],
+    기량: app_commands.Range[int, 1, 2147483647],
+    지능: app_commands.Range[int, 1, 2147483647],
+    신통력: app_commands.Range[int, 1, 2147483647],
+    자질: app_commands.Range[int, 1, 2147483647],
+    덮어쓰기: bool = False
+):
+    data = get_user_data(interaction.user.id)
+    if (data["presets"] or data["final_stats"] is not None) and not 덮어쓰기:
+        await interaction.response.send_message(
+            "❌ 기존 스탯이 있습니다. 교체하려면 `덮어쓰기: True`로 실행하세요.",
+            ephemeral=True)
+        return
+    clear_character_stats(data)
+    # 직접 입력값은 최종값이므로 생성 보정이나 보너스를 다시 적용하지 않습니다.
+    data["final_stats"] = dict(zip(STATS, [기혈, 내공, 이동, 근력, 기량, 지능, 신통력, 자질]))
+    data["manual_stats"] = True
+    save_user_data(interaction.user.id, data)
+    await interaction.response.send_message(
+        content="✅ 스탯을 저장했습니다.", embed=character_embed(data), ephemeral=True)
+
+
+@bot.tree.command(name="스탯수정", description="내 캐릭터의 최종 스탯 한 항목을 수정합니다.")
+@app_commands.choices(능력치=[app_commands.Choice(name=stat, value=stat) for stat in STATS])
+@app_commands.describe(값="변경 후 최종값을 입력하세요. (1 이상)")
+async def stats_edit(
+    interaction: discord.Interaction,
+    능력치: app_commands.Choice[str],
+    값: app_commands.Range[int, 1, 2147483647]
+):
+    data = get_user_data(interaction.user.id)
+    if data["final_stats"] is None:
+        await interaction.response.send_message(
+            "❌ 먼저 캐릭터 생성을 완료하거나 `/스탯저장`을 사용하세요.", ephemeral=True)
+        return
+    previous = data["final_stats"][능력치.value]
+    data["final_stats"][능력치.value] = 값
+    data["manual_stats"] = True
+    save_user_data(interaction.user.id, data)
+    await interaction.response.send_message(
+        content=f"✅ {능력치.value}: {previous} → {값}",
+        embed=character_embed(data), ephemeral=True)
+
+
+@bot.tree.command(name="스탯삭제", description="내 스탯과 프리셋을 삭제합니다. 특성은 유지됩니다.")
+@app_commands.describe(확인="삭제하려면 True를 선택하세요.")
+async def stats_delete(interaction: discord.Interaction, 확인: bool = False):
+    if not 확인:
+        await interaction.response.send_message(
+            "스탯과 프리셋을 삭제하려면 `/스탯삭제 확인: True`로 실행하세요. 특성은 유지됩니다.",
+            ephemeral=True)
+        return
+    data = get_user_data(interaction.user.id)
+    clear_character_stats(data)
+    save_user_data(interaction.user.id, data)
+    await interaction.response.send_message("✅ 스탯과 프리셋을 삭제했습니다. 특성은 유지됩니다.", ephemeral=True)
 
 
 # =========================================================
