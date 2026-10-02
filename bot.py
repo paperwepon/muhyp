@@ -114,7 +114,8 @@ def load_user_data(user_id):
             "bonus_stat": None,
             "bonus_amount": None,
             "traits": [],
-            "drawn_traits": []
+            "drawn_traits": [],
+            "enlightenment": 0
         }
 
     return json.loads(row["data"])
@@ -152,7 +153,8 @@ def reset_user_data(user_id):
         "bonus_stat": None,
         "bonus_amount": None,
         "traits": [],
-        "drawn_traits": []
+        "drawn_traits": [],
+        "enlightenment": 0
     }
 
     save_user_data(user_id, data)
@@ -243,6 +245,69 @@ def get_available_bonus_stats(stats):
         for stat in STATS
         if is_bonus_available(stat, stats[stat])
     ]
+
+
+# =========================================================
+# 경지 계산
+# =========================================================
+
+def calculate_realm(final_stats, enlightenment=0):
+    """
+    경지를 계산합니다.
+    계산식: (기혈 + 내공 + 주스텟) / 3
+    
+    150 이상부터는 깨달음이 필요합니다 (깨달음 5 = 경지 1)
+    """
+    
+    # 주스텟 계산 (신통력과 자질 중 높은 값)
+    main_stat = max(final_stats.get("신통력", 0), final_stats.get("자질", 0))
+    
+    # 경지 계산: (기혈 + 내공 + 주스텟) / 3
+    base_realm = (final_stats.get("기혈", 0) + final_stats.get("내공", 0) + main_stat) // 3
+    
+    # 깨달음에 따른 추가 경지 (깨달음 5 = 경지 1)
+    additional_realm = enlightenment // 5
+    
+    total_realm = base_realm + additional_realm
+    
+    return total_realm
+
+
+def get_realm_name(realm_value):
+    """
+    경지값에 따라 경지 이름을 반환합니다.
+    """
+    
+    if 0 <= realm_value <= 10:
+        return "삼류 하"
+    elif 11 <= realm_value <= 20:
+        return "삼류 중"
+    elif 21 <= realm_value <= 30:
+        return "삼류 상"
+    elif 31 <= realm_value <= 39:
+        return "이류 하"
+    elif 40 <= realm_value <= 49:
+        return "이류 중"
+    elif realm_value == 50:
+        return "이류 상"
+    elif 51 <= realm_value <= 100:
+        return "일류 하"
+    elif 101 <= realm_value <= 125:
+        return "일류 중"
+    elif 126 <= realm_value <= 149:
+        return "일류 상"
+    elif realm_value == 150:
+        return "일류 최상"
+    elif 151 <= realm_value <= 200:
+        return "절정 하"
+    elif 201 <= realm_value <= 250:
+        return "절정 중"
+    elif 251 <= realm_value <= 299:
+        return "절정 상"
+    elif realm_value >= 300:
+        return "절정 최상"
+    else:
+        return "미정"
 
 
 # =========================================================
@@ -407,6 +472,22 @@ def character_embed(data):
                    data["final_stats"], data["bonus_stat"], data["bonus_amount"])),
         inline=False
     )
+
+    # 경지 정보 추가
+    if data.get("final_stats"):
+        realm_value = calculate_realm(data["final_stats"], data.get("enlightenment", 0))
+        realm_name = get_realm_name(realm_value)
+        enlightenment = data.get("enlightenment", 0)
+        
+        realm_info = f"**경지값**: {realm_value}\n**경지**: {realm_name}"
+        if enlightenment > 0:
+            realm_info += f"\n**깨달음**: {enlightenment}"
+        
+        embed.add_field(
+            name="🏔️ 경지",
+            value=realm_info,
+            inline=False
+        )
 
     if data.get("drawn_traits"):
 
@@ -817,7 +898,7 @@ class CharacterView(
 # 캐릭터 상태를 비교하여 오래된 입력창의 덮어쓰기를 방지합니다.
 def character_snapshot(data):
     keys = ("presets", "selected_preset", "base_stats", "final_stats",
-            "bonus_stat", "bonus_amount", "manual_stats")
+            "bonus_stat", "bonus_amount", "manual_stats", "enlightenment")
     return json.dumps({key: data.get(key) for key in keys}, ensure_ascii=False, sort_keys=True)
 
 
@@ -859,28 +940,41 @@ class CharacterEditButton(discord.ui.Button):
             await interaction.response.send_message("❌ 수정할 최종 스탯이 없습니다.", ephemeral=True)
             return
         await interaction.response.send_message(
-            "수정할 능력치를 선택하세요. 제출하면 자동 저장됩니다.",
+            "수정할 항목을 선택하세요.",
             view=StatEditView(interaction.user.id), ephemeral=True)
 
 
 class StatEditView(OwnerView):
     def __init__(self, user_id):
         super().__init__(user_id)
-        self.add_item(StatEditSelect())
+        
+        # 능력치 수정
+        stat_options = [discord.SelectOption(label=stat, value=f"stat_{stat}") for stat in STATS]
+        # 깨달음 수정
+        stat_options.append(discord.SelectOption(label="깨달음", value="enlightenment"))
+        
+        self.add_item(StatEditSelect(stat_options))
 
 
 class StatEditSelect(discord.ui.Select):
-    def __init__(self):
-        super().__init__(placeholder="수정할 능력치 선택",
-                         options=[discord.SelectOption(label=stat, value=stat) for stat in STATS])
+    def __init__(self, options):
+        super().__init__(placeholder="수정할 항목 선택", options=options)
 
     async def callback(self, interaction):
         data = get_user_data(interaction.user.id)
         if data["final_stats"] is None:
             await interaction.response.send_message("❌ 캐릭터가 삭제되었습니다.", ephemeral=True)
             return
-        await interaction.response.send_modal(
-            StatEditModal(interaction.user.id, self.values[0], data))
+        
+        selected = self.values[0]
+        
+        if selected == "enlightenment":
+            await interaction.response.send_modal(
+                EnlightenmentEditModal(interaction.user.id, data))
+        else:
+            stat_name = selected.replace("stat_", "")
+            await interaction.response.send_modal(
+                StatEditModal(interaction.user.id, stat_name, data))
 
 
 class StatEditModal(discord.ui.Modal):
@@ -916,6 +1010,42 @@ class StatEditModal(discord.ui.Modal):
         save_user_data(self.user_id, data)
         await interaction.response.edit_message(
             content=f"✅ {self.stat}: {previous} → {value} · 저장 완료",
+            embed=character_embed(data), view=CharacterView(self.user_id))
+
+
+class EnlightenmentEditModal(discord.ui.Modal):
+    def __init__(self, user_id, data):
+        super().__init__(title="깨달음 수정", timeout=900)
+        self.user_id = user_id
+        self.snapshot = character_snapshot(data)
+        self.value_input = discord.ui.TextInput(
+            label="깨달음 (경지 150 이상에서 사용)", 
+            default=str(data.get("enlightenment", 0)),
+            placeholder="0 이상의 정수 (깨달음 5 = 경지 1)", max_length=10)
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ 본인의 깨달음만 수정할 수 있습니다.", ephemeral=True)
+            return
+        try:
+            value = int(str(self.value_input).strip())
+        except ValueError:
+            value = 0
+        if not 0 <= value <= 2147483647:
+            await interaction.response.send_message("❌ 0~2147483647 사이의 정수를 입력하세요. 수정 버튼으로 다시 입력할 수 있습니다.", ephemeral=True)
+            return
+        data = get_user_data(self.user_id)
+        if data["final_stats"] is None or character_snapshot(data) != self.snapshot:
+            await interaction.response.send_message(
+                "❌ 입력 중 캐릭터가 변경되었습니다. `/캐릭터`에서 다시 수정하세요.", ephemeral=True)
+            return
+        previous = data.get("enlightenment", 0)
+        data["enlightenment"] = value
+        data["manual_stats"] = True
+        save_user_data(self.user_id, data)
+        await interaction.response.edit_message(
+            content=f"✅ 깨달음: {previous} → {value} · 저장 완료",
             embed=character_embed(data), view=CharacterView(self.user_id))
 
 
@@ -1354,7 +1484,10 @@ def clear_character_stats(data):
 
 
 @bot.tree.command(name="스탯저장", description="8개 최종 스탯을 직접 입력하여 저장합니다.")
-@app_commands.describe(덮어쓰기="기존 스탯을 교체하려면 True를 선택하세요.")
+@app_commands.describe(
+    덮어쓰기="기존 스탯을 교체하려면 True를 선택하세요.",
+    깨달음="경지 150 이상에서 사용 가능합니다 (기본값: 0)"
+)
 async def stats_save(
     interaction: discord.Interaction,
     기혈: app_commands.Range[int, 1, 2147483647],
@@ -1365,7 +1498,8 @@ async def stats_save(
     지능: app_commands.Range[int, 1, 2147483647],
     신통력: app_commands.Range[int, 1, 2147483647],
     자질: app_commands.Range[int, 1, 2147483647],
-    덮어쓰기: bool = False
+    덮어쓰기: bool = False,
+    깨달음: app_commands.Range[int, 0, 2147483647] = 0
 ):
     data = get_user_data(interaction.user.id)
     if (data["presets"] or data["final_stats"] is not None) and not 덮어쓰기:
@@ -1376,13 +1510,14 @@ async def stats_save(
     clear_character_stats(data)
     # 직접 입력값은 최종값이므로 생성 보정이나 보너스를 다시 적용하지 않습니다.
     data["final_stats"] = dict(zip(STATS, [기혈, 내공, 이동, 근력, 기량, 지능, 신통력, 자질]))
+    data["enlightenment"] = 깨달음
     data["manual_stats"] = True
     save_user_data(interaction.user.id, data)
     await interaction.response.send_message(
         content="✅ 스탯을 저장했습니다.", embed=character_embed(data), ephemeral=True)
 
 
-@bot.tree.command(name="스탯수정", description="내 캐릭터의 최종 스탯 한 항목을 수정합니다.")
+@bot.tree.command(name="스탯수��", description="내 캐릭터의 최종 스탯 한 항목을 수정합니다.")
 @app_commands.choices(능력치=[app_commands.Choice(name=stat, value=stat) for stat in STATS])
 @app_commands.describe(값="변경 후 최종값을 입력하세요. (1 이상)")
 async def stats_edit(
@@ -1514,3 +1649,4 @@ async def on_ready():
 # =========================================================
 
 bot.run(TOKEN)
+
