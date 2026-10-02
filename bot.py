@@ -877,6 +877,7 @@ class CharacterView(
         self.add_item(CharacterEditButton())
         self.add_item(CharacterDeleteButton())
         self.add_item(CharacterRefreshButton())
+        self.add_item(CharacterCombatButton())
 
     async def interaction_check(
         self,
@@ -1214,6 +1215,7 @@ async def wuxia_generate(
             ephemeral=True)
         return
     data.pop("manual_stats", None)
+    data.pop("combat", None)
 
     # 능력치 생성 관련 데이터만 초기화
     data["presets"] = [
@@ -1481,6 +1483,7 @@ def clear_character_stats(data):
     data.update(presets=[], selected_preset=None, base_stats=None,
                 final_stats=None, bonus_stat=None, bonus_amount=None)
     data.pop("manual_stats", None)
+    data.pop("combat", None)
 
 
 @bot.tree.command(name="스탯저장", description="8개 최종 스탯을 직접 입력하여 저장합니다.")
@@ -1647,6 +1650,265 @@ async def on_ready():
 # =========================================================
 # 실행
 # =========================================================
+
+# =========================================================
+# 무공 계산: 선택한 심법과 수련도는 사용자별로 DB에 보관합니다.
+# =========================================================
+import ast
+from fractions import Fraction
+
+HEART_METHODS = {
+    "웅패신공": ("녹림", "1.2", "30% 달성마다 기혈 +5, 근력 +5"),
+    "육합공": ("화산파", "1.4", "처음 익히면 기혈 +10, 내공 +10"),
+    "소청기공": ("도가", "1.3", "처음 배우면 신통력 +10"),
+    "태청기공": ("도가", "1.8", "정순하고 부드러운 정종 내공"),
+    "도반삼양귀원공": ("사천당가", "1.8", "독·암기 기 운용 보조"),
+    "태백일심법": ("점창파", "1.5", "4절기 내공 수련 시 고정값 +5"),
+    "혼원공": ("개방", "1.4", "매턴 내공 5% 회복, 최소 1"),
+    "북명신공": ("미지정", "3.5", "한계 내공량 무한")
+}
+
+# 문파, 이름, 極 기준, 일반식, 極 식(없으면 일반식), 소모, 참고효과
+ATTACK_ROWS = [
+("무당파","무당장권",300,"(수련도/30+이동/20)*배율","(수련도/30+이동/10)*배율","1","입문 권법"),
+("아미파","소청신권",400,"(수련도/20+기량/20)*배율",None,"3","입문 권법"),
+("점창파","궁전권",400,"(수련도/20+기량/2)*배율",None,"3","極 충자 준비 후 돌진 시 명중·피해 배율 +2 (조건부, 미적용)"),
+("소림사","백보신권",500,"(수련도/25+근력/30)*2",None,"3","원거리 정권"),
+("점창파","섬광분운검법",600,"(성취도+기량/2)*배율","(성취도+기량/2+내공/6)*배율","5","연타 d6, 급소 +2"),
+("화산파","육합검법(기본)",600,"(수련도/25+기량/30)*배율","(수련도/25+기량/30+내공/20)*배율","3","極 6초식 사용 가능"),
+("화산파","육합귀일",600,None,"(수련도*3/50+기량/30+내공/20)*배율","15","16.666…는 50/3으로 처리. 極 전용, 사거리 기량/5"),
+("무당파","신문십삼검",600,"(수련도/40+기량/20+지능/10)*배율","(수련도/50+기량/20+지능/10)*배율","1","지성은 저장된 지능 사용. 신문혈·무장해제"),
+("녹림","녹림권법",600,"(수련도/20+근력/30)*배율","(수련도/20+근력/30+녹림보정)*배율","2","極 기혈 +5, 근력 +5 (스탯에 자동 가산하지 않음)"),
+("점창파","관일창법",600,"(수련도/30+기량/2)*배율","(수련도/30+기량/2+내공/6)*배율","5","사거리 기량/2, 급소 +2"),
+("개방","연화장",600,"(수련도/20+근력/30)*배율",None,"3","내공 없이 사용 시 배율 미적용. 極 처음 보는 상대 확정 명중 (조건부, 미적용)"),
+("개방","복호권",600,"(수련도/25+근력/15)*배율",None,"2","내공 없이 사용 가능. 極 낮은 경지 상대 최종 명중·피해 +5 (조건부, 미적용)"),
+("개방","타소봉법",600,"(수련도/25+근력/30)*배율","(수련도/25+근력/30+5)*배율","1","표의 * 주석 미제공. 뇌진탕 등 조건부 효과 미적용"),
+("점창파","창응칠식",700,"(성취도+기량/3)*배율","(성취도+기량/3+10)*배율","10","極 기습 원거리 시 기량 항 3배 (조건부, 미적용)"),
+("소림사","나한권",700,"(수련도/50+근력/5)*2",None,"미기재","권법"),
+("무당파","면장",900,"(수련도/40+기량/20)*배율","(수련도/40+기량/20)*(배율+1)","15","근접·단일"),
+("무당파","요지유검",950,"(수련도/30+기량/20)*배율","(수련도/30+기량/20+지능/10)*배율","5","지성=지능. 極 유수련 명중 1/3 (조건부, 미적용)"),
+("사천당가","구환살",1200,"(수련도/20+기량/15)*배율","미확정","25","極 +내공/15의 적용 위치 확인 필요. 낮은 경지 상대 확정 명중 (조건부)"),
+("사천당가","배심정",1200,"(수련도/20+기량/10)*배율","미확정","15","極 +내공/15의 적용 위치 확인 필요"),
+("무당파","십단금",1200,"(수련도/25+기량/15)*배율","(수련도/25+기량/15+10)*배율","25","極 피해 절반 호신강기 무시"),
+("소림사","대력금강지",1200,"(수련도/20+근력/10)*배율","(수련도/25+근력/10)*배율","15","極 방어 피해감소 무시"),
+("곤륜파","태허도룡검법",1500,"(수련도/15+기량/10)*배율","미확정","15","곤륜파 내공은 선택 심법배율로 처리. 極 +근력/20 위치 확인 필요. 이형 명중 +1 (조건부)"),
+("명교","화조풍월",3000,"(수련도/60+기량/3)*3","(수련도/20+기량/2)*3","30","고정 배율 3"),
+("명교","경화수월",3000,"(수련도/50+기량/2)*3","(수련도/10+기량)*3","50","첫 출수 절대명중 +4, 이후 명중식 절반 (조건부, 미적용)"),
+("명교","비화낙엽",3000,"(수련도/40+기량/2)*3","(수련도/20+기량)*3","50","첫 공격 절대명중 +2 (조건부, 미적용)"),
+("명교","유록화홍",3000,"(수련도/100+내공/4)*3","(수련도/50+기량/3+내공/10)*3","내공 1할","내력 대결"),
+("명교","백화요란",3000,"(수련도/200+기량/5)*3","(수련도/100+기량/5)*3","50","반원 범위 기량/10, 대상 기량/50"),
+("명교","낙화낭자",3000,"(수련도/20+기량)*3","(수련도/10+기량)*3","30","같은 상대 1회, 다음 회피·명중 절대보정 -2"),
+("명교","금상첨화",3000,"(수련도/60+기량/3)*3","(수련도/30+기량/2)*3","50","절대명중 +2 (미적용). 같은 상대 1회"),
+("동사","탄지신통",3000,"(근력/2+기량/2)*배율","(수련도/6+근력/2+기량/2)*배율","20","표의 0.5는 참고값; 식의 배율은 선택 심법 사용. 極 자동반격"),
+("사천당가","만천화우",5000,"(수련도/10+기량/10)*배율","미확정","전체 내공 5할, 최소 100","極 +내공/15 위치 확인 필요"),
+("혈구음진경","진 구음백골조",5000,"(수련도+마기/3)*배율",None,"예비기혈","특수 즉사 판정은 자동 처리하지 않음"),
+("화산파","이십사수매화검법",5000,"(수련도/10+기량/10+내공/10)*배율",None,"25","궁극 절학"),
+("무당파","태극검",25000,"(수련도/50+기량)*2",None,"미기재","고정 배율 2")
+]
+MOVE_ROWS = [
+("화산파","초상비",400,"(수련도/40+이동/10)*배율","(수련도/20+이동/10+5)*배율","3","기초 경공"),
+("개방","초상비(草上飛)",400,"(수련도/40+이동/10)*배율","(수련도/40+이동/10+5)*배율","3","極 식 +5"),
+("녹림","산악신법",400,"(수련도/30+이동/15)*배율",None,"3","산악 지형, 極 나려타곤 가능"),
+("무당파","건곤구공",600,"(수련도/40+이동/10)*배율",None,"3","極 출수·회피 +1 (절대보정은 별도 표시, 수식에 미합산)"),
+("곤륜파","운해비영",800,"(수련도/30+이동/20)*배율","(수련도/30+이동/20+신통력/10)*배율","3","極 회피 실패 피해 1할 경감"),
+("아미파","영활선변",800,"(수련도/25+이동/10)*배율",None,"3","사각 파고들기"),
+("사천당가","귀영보",800,"(수련도/20+이동/10)*배율","(수련도/25+이동/10)*배율","3","기습 출수 +1, 상태이상 급소 +1"),
+("점창파","비운축영",900,"(수련도/20+이동/15)*배율",None,"3","추격 거리 ×1.5, 極 출수 +1·최소타수 +1"),
+("소림사","일위도강",900,"(수련도/30+이동/20)*2",None,"미기재","고정 배율 2"),
+("무당파","제운종",1200,"(수련도/20+이동/10)*2",None,"0","기본 출수·회피 +1, 極 내공10 소모 추가 +1 (별도 보정)"),
+("혈구음진경","혈해유령보",4000,"수련도+마기/3",None,"예비기혈","極 절대회피 +3, 실패 피해무효는 조건부"),
+("새외","성화령신공",0,"(마기/2)*3",None,"0","고정 배율 3")
+]
+ATTACKS = {str(i): row for i, row in enumerate(ATTACK_ROWS)}
+MOVES = {str(i): row for i, row in enumerate(MOVE_ROWS)}
+
+
+def formula_value(formula, values):
+    """등록된 식만 AST로 계산합니다. 나눗셈과 최종값은 버림, 배율은 정확한 유리수."""
+    def walk(node):
+        if isinstance(node, ast.Name):
+            if node.id not in values or values[node.id] is None:
+                raise ValueError(f"{node.id} 입력이 필요합니다.")
+            return Fraction(str(values[node.id]))
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return Fraction(str(node.value))
+        if isinstance(node, ast.BinOp):
+            left, right = walk(node.left), walk(node.right)
+            if isinstance(node.op, ast.Add): return left + right
+            if isinstance(node.op, ast.Mult): return left * right
+            if isinstance(node.op, ast.Div): return Fraction(left // right)
+        raise ValueError("지원하지 않는 계산식입니다.")
+    result = walk(ast.parse(formula, mode="eval").body)
+    return result.numerator // result.denominator
+
+
+def combat_settings(data):
+    c = data.get("combat", {})
+    return {"heart": c.get("heart"), "attack": c.get("attack"), "move": c.get("move"),
+            "attack_training": dict(c.get("attack_training", {})),
+            "move_training": dict(c.get("move_training", {})),
+            "achievement": c.get("achievement"), "magic": c.get("magic")}
+
+
+def combat_embed(data):
+    c = combat_settings(data)
+    heart = HEART_METHODS.get(c["heart"])
+    embed = discord.Embed(title="⚔️ 무공 명중·회피 계산", color=discord.Color.blue())
+    embed.description = (f"심법: **{c['heart']} ×{heart[1]}**\n{heart[2]}" if heart else "심법을 선택하세요.")
+    for kind, label, catalog in (("attack", "명중치", ATTACKS), ("move", "회피치", MOVES)):
+        key = c[kind]
+        if key not in catalog:
+            embed.add_field(name=label, value="무공을 선택하세요.", inline=False)
+            continue
+        sect, name, limit, normal, extreme, cost, note = catalog[key]
+        training = c[kind + "_training"].get(key)
+        text = f"{sect} · **{name}** · 소모 {cost}\n"
+        if training is None:
+            text += "수련도 입력이 필요합니다."
+        else:
+            mastered = training >= limit
+            formula = (extreme or normal) if mastered else normal
+            text += f"수련도 {training} / 極 기준 {limit} · {'極' if mastered else '일반'}\n"
+            if formula is None or formula == "미확정":
+                text += "**계산 보류: 해당 단계의 식이 미공개 또는 적용 위치 미확정입니다.**"
+                if normal: text += f"\n일반식 참고: `{normal}`"
+            elif "배율" in formula and heart is None:
+                text += "심법을 선택하세요."
+            else:
+                values = dict(data["final_stats"])
+                values.update(수련도=training, 배율=heart[1] if heart else None,
+                              성취도=c["achievement"], 마기=c["magic"], 녹림보정=Fraction(1, 6))
+                try:
+                    value = formula_value(formula, values)
+                    text += f"`{formula}`\n**{label}: {value}**"
+                    used = sorted({n.id for n in ast.walk(ast.parse(formula, mode="eval")) if isinstance(n, ast.Name)})
+                    text += "\n사용값: " + ", ".join(f"{n}={values[n]}" for n in used)
+                except ValueError as error:
+                    text += str(error)
+        text += f"\n참고: {note}"
+        embed.add_field(name=label, value=text, inline=False)
+    embed.set_footer(text="각 나눗셈·최종값 버림 | 수련도 ≥ 기준이면 極 | 조건부·절대보정, 피해, 자원 차감 미적용")
+    return embed
+
+
+class CombatSelect(discord.ui.Select):
+    def __init__(self, kind, options, row):
+        super().__init__(placeholder={"heart":"심법 선택", "attack":"공격 무공 선택", "move":"경공 선택"}[kind], options=options, row=row)
+        self.kind = kind
+
+    async def callback(self, interaction):
+        data = get_user_data(interaction.user.id)
+        if data["final_stats"] is None:
+            await interaction.response.send_message("❌ 캐릭터 스탯을 먼저 저장하세요.", ephemeral=True)
+            return
+        c = combat_settings(data)
+        c[self.kind] = self.values[0]
+        data["combat"] = c
+        save_user_data(interaction.user.id, data)
+        await interaction.response.edit_message(embed=combat_embed(data), view=CombatView(interaction.user.id, data))
+
+
+class CombatView(OwnerView):
+    def __init__(self, user_id, data):
+        super().__init__(user_id)
+        c = combat_settings(data)
+        self.add_item(CombatSelect("heart", [discord.SelectOption(label=f"{v[0]} · {k} ×{v[1]}", value=k, default=c["heart"]==k) for k,v in HEART_METHODS.items()], 0))
+        # Discord의 선택 메뉴당 25개 제한에 맞춰 공격 목록을 나눕니다.
+        entries = list(ATTACKS.items())
+        for page in range(2):
+            self.add_item(CombatSelect("attack", [discord.SelectOption(label=f"{v[0]} · {v[1]}", value=k, default=c["attack"]==k) for k,v in entries[page*25:(page+1)*25]], page+1))
+        self.add_item(CombatSelect("move", [discord.SelectOption(label=f"{v[0]} · {v[1]}", value=k, default=c["move"]==k) for k,v in MOVES.items()], 3))
+
+    @discord.ui.button(label="📝 수련도·추가값 입력", style=discord.ButtonStyle.primary, row=4)
+    async def training(self, interaction, button):
+        data = get_user_data(self.user_id)
+        if data["final_stats"] is None:
+            await interaction.response.send_message("❌ 캐릭터가 삭제되었습니다.", ephemeral=True)
+            return
+        c = combat_settings(data)
+        if c["attack"] not in ATTACKS and c["move"] not in MOVES:
+            await interaction.response.send_message("먼저 공격 무공이나 경공을 선택하세요.", ephemeral=True)
+            return
+        await interaction.response.send_modal(CombatTrainingModal(self.user_id, data))
+
+    @discord.ui.button(label="🔄 최신 스탯으로 계산", style=discord.ButtonStyle.secondary, row=4)
+    async def refresh(self, interaction, button):
+        data = get_user_data(self.user_id)
+        if data["final_stats"] is None:
+            await interaction.response.edit_message(content="캐릭터가 삭제되었습니다.", embed=None, view=None)
+            return
+        await interaction.response.edit_message(embed=combat_embed(data), view=CombatView(self.user_id, data))
+
+
+class CombatTrainingModal(discord.ui.Modal):
+    def __init__(self, user_id, data):
+        super().__init__(title="수련도·추가값 입력", timeout=900)
+        self.user_id = user_id
+        self.previous = combat_settings(data)
+        self.snapshot = character_snapshot(data)
+        self.inputs = {}
+        c = self.previous
+        for kind, catalog in (("attack",ATTACKS),("move",MOVES)):
+            if c[kind] in catalog:
+                default = c[kind+"_training"].get(c[kind])
+                item = discord.ui.TextInput(label=f"{catalog[c[kind]][1]} 수련도", default=str(default) if default is not None else None, placeholder="0 이상의 정수", max_length=10)
+                self.inputs[kind] = item
+                self.add_item(item)
+        for key, label in (("achievement", "성취도 (해당 식에 필요할 때 입력)"),("magic","마기 (해당 식에 필요할 때 입력)")):
+            item = discord.ui.TextInput(label=label, required=False, default=str(c[key]) if c[key] is not None else None, placeholder="미정이면 비워 두세요 · 0 이상 정수", max_length=10)
+            self.inputs[key] = item
+            self.add_item(item)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ 본인만 입력할 수 있습니다.", ephemeral=True)
+            return
+        parsed = {}
+        for key, item in self.inputs.items():
+            raw = str(item).strip()
+            if not raw and key in ("achievement", "magic"):
+                parsed[key] = None
+                continue
+            if not raw.isascii() or not raw.isdecimal() or int(raw) > 2147483647:
+                await interaction.response.send_message("❌ 0~2147483647 사이의 정수를 입력하세요. 입력 버튼으로 다시 시도할 수 있습니다.", ephemeral=True)
+                return
+            parsed[key] = int(raw)
+        data = get_user_data(self.user_id)
+        c = combat_settings(data)
+        if data["final_stats"] is None or character_snapshot(data) != self.snapshot or c != self.previous:
+            await interaction.response.send_message("❌ 입력 중 설정 또는 스탯이 변경되었습니다. `/무공`에서 다시 입력하세요.", ephemeral=True)
+            return
+        for key, value in parsed.items():
+            if key in ("attack", "move"):
+                c[key+"_training"][c[key]] = value
+            else:
+                c[key] = value
+        data["combat"] = c
+        save_user_data(self.user_id, data)
+        await interaction.response.edit_message(content="✅ 설정 저장 완료", embed=combat_embed(data), view=CombatView(self.user_id, data))
+
+
+async def open_combat(interaction):
+    data = get_user_data(interaction.user.id)
+    if data["final_stats"] is None:
+        await interaction.response.send_message("❌ 먼저 `/무협생성`을 완료하거나 `/스탯저장`을 사용하세요.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=combat_embed(data), view=CombatView(interaction.user.id, data), ephemeral=True)
+
+
+class CharacterCombatButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="⚔️ 무공 계산", style=discord.ButtonStyle.primary, row=1)
+
+    async def callback(self, interaction):
+        await open_combat(interaction)
+
+
+@bot.tree.command(name="무공", description="심법·무공·경공과 수련도를 설정하여 명중치·회피치를 계산합니다.")
+async def martial_calculator(interaction: discord.Interaction):
+    await open_combat(interaction)
+
+
 
 bot.run(TOKEN)
 
